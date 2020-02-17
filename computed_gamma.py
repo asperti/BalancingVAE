@@ -218,21 +218,23 @@ def deconv2d(input_, output_shape, k_h, k_w, d_h, d_w, stddev=0.02, name="deconv
         biases = tf.get_variable("biases", [output_shape[-1]], initializer=tf.constant_initializer(0.0))
     return tf.reshape(tf.nn.bias_add(deconv, biases), deconv.get_shape())
 
-def downsample(x, out_dim, kernel_size, l2_reg, name):
+def downsample(x, out_dim, kernel_size, name, l2_reg=None):
     with tf.variable_scope(name):
         input_shape = x.get_shape().as_list()
         assert(len(input_shape) == 4)
-        #return tf.layers.conv2d(x, out_dim, kernel_size, 2, 'same')
-        return (tf.keras.layers.Conv2D(out_dim, kernel_size, strides=2, padding='same',kernel_regularizer=regularizers.l2(l2_reg))(x))
+        kernel_reg = None
+        if l2_reg != None:
+          kernel_reg = regularizers.l2(l2_reg)
+        return (tf.keras.layers.Conv2D(out_dim, kernel_size, strides=2, padding='same',kernel_regularizer=kernel_reg)(x))
 
-def upsample(x, out_dim, kernel_size, l2_reg, name):
+def upsample(x, out_dim, kernel_size, name, l2_reg=None):
     with tf.variable_scope(name):
         input_shape = x.get_shape().as_list()
         assert(len(input_shape) == 4)
-        #return tf.layers.conv2d_transpose(x, out_dim, kernel_size, 2, 'same')
-        #return (tf.keras.layers.Conv2DTranspose(out_dim, kernel_size, strides=2, padding='same',kernel_regularizer='l2',activity_regularizer='l2')(x))
-        return (tf.keras.layers.Conv2DTranspose(out_dim, kernel_size, strides=2, padding='same',kernel_regularizer=regularizers.l2(l2_reg))(x))
-
+        kernel_reg = None
+        if l2_reg != None:
+          kernel_reg = regularizers.l2(l2_reg)
+        return (tf.keras.layers.Conv2DTranspose(out_dim, kernel_size, strides=2, padding='same',kernel_regularizer=kernel_reg)(x))
 
 def res_block(x, out_dim, is_training, name, depth=2, kernel_size=3):
     with tf.variable_scope(name):
@@ -285,7 +287,6 @@ class TwoStageVaeModel(object):
         self.latent_dim = latent_dim
         self.second_dim = second_dim
         self.img_dim = x.get_shape().as_list()[1]
-
         self.second_depth = second_depth
 
         self.is_training = tf.placeholder(tf.bool, [], 'is_training')
@@ -310,6 +311,7 @@ class TwoStageVaeModel(object):
         HALF_LOG_TWO_PI = 0.91893
         k = (2*self.img_dim/self.latent_dim)**2
         self.kl_loss1 = tf.reduce_sum(tf.square(self.mu_z) + tf.square(self.sd_z) - 2 * self.logsd_z - 1) / 2.0 / float(self.batch_size)
+        self.mse_loss1 = tf.losses.mean_squared_error(self.x, self.x_hat)
         self.loggamma_x = tf.log(self.gamma_x)
         self.gen_loss1 = tf.reduce_sum(tf.square((self.x - self.x_hat) / self.gamma_x) / 2.0 + self.loggamma_x + HALF_LOG_TWO_PI) / float(self.batch_size)
         self.loss1 = k*self.kl_loss1 + self.gen_loss1 
@@ -416,7 +418,7 @@ class TwoStageVaeModel(object):
         #return recon_x
         return mu_z_tot, logsd_z_tot, recon_x
 
-    def generate(self, sess, num_sample, stage=2):
+    def generate(self, sess, num_sample, stage=2, adjust2=None, adjust1=None):
         num_iter = int(math.ceil(float(num_sample) / float(self.batch_size)))
         gen_samples = []
         gen_z = []
@@ -426,17 +428,28 @@ class TwoStageVaeModel(object):
                 u = np.random.normal(0, 1, [self.batch_size, self.latent_dim])
                 # z ~ N(f_2(u), \gamma_z I)
                 z = sess.run(self.z_hat, feed_dict={self.u: u, self.is_training: False})
-                z = z/np.mean(np.std(z,axis=0))
+                if type(adjust2) == np.float32: #np.ndarray
+                    #print("normalizing 2")
+                    rescale = adjust2/np.mean(np.std(z,axis=0))
+                    #print(rescale)
+                    z = z*rescale
             else:
                 z = np.random.normal(0, 1, [self.batch_size, self.latent_dim])
+                if type(adjust2) == np.float32: #np.ndarray
+                   z = z*adjust2
             # x = f_1(z)
             x = sess.run(self.x_hat, feed_dict={self.z: z, self.is_training: False})
             gen_z.append(z)
             gen_samples.append(x)
         gen_z = np.concatenate(gen_z, 0)
         gen_samples = np.concatenate(gen_samples, 0)
+        if type(adjust1) == np.float:
+            rescale = adjust1/np.mean(np.std(gen_samples,axis=0))
+            gmean = np.mean(gen_samples,axis=0)
+            gen_samples = (gen_samples - gmean)*rescale + gmean
+            #need to remain in range 0-1
+            gen_samples = np.maximum(np.minimum(gen_samples,1),0)
         return (gen_samples[0:num_sample],gen_z[0:num_sample])
-
 
 class Resnet(TwoStageVaeModel):
     def __init__(self, x, num_scale, block_per_scale=1, depth_per_block=2, kernel_size=3, base_dim=16, fc_dim=512, latent_dim=64, second_depth=3, second_dim=1024, l2_reg=.001):
@@ -458,12 +471,11 @@ class Resnet(TwoStageVaeModel):
 
                 if i != self.num_scale - 1:
                     dim *= 2
-                    y = downsample(y, dim, self.kernel_size, self.l2_reg, 'downsample'+str(i))
+                    y = downsample(y, dim, self.kernel_size, 'downsample'+str(i), self.l2_reg)
             
             y = tf.reduce_mean(y, [1, 2])
             y = scale_fc_block(y, self.fc_dim, 'fc', 1, self.depth_per_block)
             
-            #self.mu_z = tf.layers.dense(y, self.latent_dim*4)
             self.mu_z = tf.layers.dense(y, self.latent_dim)
             self.logsd_z = tf.layers.dense(y, self.latent_dim)
             self.sd_z = tf.exp(self.logsd_z)
@@ -490,7 +502,7 @@ class Resnet(TwoStageVaeModel):
             y = tf.reshape(y, [-1, 2, 2, dims[0]])
 
             for i in range(len(scales)-1):
-                y = upsample(y, dims[i+1], self.kernel_size, self.l2_reg, 'up'+str(i))
+                y = upsample(y, dims[i+1], self.kernel_size, 'up'+str(i), self.l2_reg)
                 y = scale_block(y, dims[i+1], self.is_training, 'scale'+str(i), self.block_per_scale, self.depth_per_block, self.kernel_size)
             
             y = tf.layers.conv2d(y, data_depth, self.kernel_size, 1, 'same')
@@ -507,6 +519,7 @@ def main():
     if not os.path.exists(exp_folder):
         os.makedirs(exp_folder)
     model_path = os.path.join(exp_folder, 'checkp')
+    #model_path = '../Tensor/experiments/cifar10/Exp_1/model_best_from1_rate05_every250'
     if not os.path.exists(model_path):
         os.makedirs(model_path)
 
@@ -599,22 +612,45 @@ def main():
         saver.save(sess, os.path.join(model_path, 'stage2'))
     else:
         saver.restore(sess, os.path.join(model_path, 'stage2'))
-    
+        #saver.restore(sess, '../Tensor/experiments/cifar10/Exp_1/model_best_from1_rate05_every250/stage2')
+        #saver.save(sess, os.path.join(model_path, 'stage2'))
     x = x[0:10000]
     
     tf.reset_default_graph()
     zmean, zlogvar, img_recons = model.reconstruct(sess, x)
-
-    img_gens1,_ = model.generate(sess, 10000, 1)
-    img_gens2,gen_z = model.generate(sess, 10000, 2)
-
     x = x.astype("float32") / 255
+
+    zmeanvar = np.var(zmean, axis = 0)
+    zlogvarmean = np.mean(np.exp(zlogvar), axis = 0) #check
+    zsum = zmeanvar + zlogvarmean
+    
+    adjust1 = None
+    adjust2 = None
+    if args.adjust:
+        adjust1 = np.std(x,axis=0)  #None
+        z_hat = model.reconstruct2(sess,zmean)
+        mse2 = np.mean(np.square(zmean - z_hat))
+        var_loss2 = np.mean(zmeanvar) - np.mean(np.var(z_hat,axis=0))
+        #we apply an adjustment only if there is an evident variance loss
+        if var_loss2/mse2 > .25:
+            #the adjustment is equal to the std provided by var law (close to 1)
+            adjust2 = np.sqrt(np.mean(zsum))
+        #fixing reconstructed images
+        rescale = np.mean(adjust1)/np.mean(np.std(img_recons,axis=0))
+        gmean = np.mean(img_recons,axis=0)
+        img_recons = (img_recons - gmean)*rescale + gmean
+        #need to remain in range 0-1
+        img_recons = np.maximum(np.minimum(img_recons,1),0)
+        #computing adjustments for generated images
+
+    img_gens1,_ = model.generate(sess, 10000, 1, adjust2, adjust1)        
+    img_gens2,gen_z = model.generate(sess, 10000, 2, adjust2, adjust1)
 
     # computing FID can be expensive 
     if True:
         print("Rec FID: ", fid.get_fid(x, img_recons.copy()))
-        print("Gen FID (1): ", fid.get_fid(x, img_gens1.copy()))
-        print("Gen FID (2): ", fid.get_fid(x, img_gens2.copy()))
+        print("Gen FID (1):", fid.get_fid(x, img_gens1.copy()))
+        print("Gen FID (2) : ", fid.get_fid(x, img_gens2.copy()))
     
     #img_recons_sample = stich_imgs_2(x, img_recons)
     #img_gens1_sample = stich_imgs(img_gens1)
@@ -623,12 +659,7 @@ def main():
     #plt.imsave(os.path.join(exp_folder, 'gen2_sample.jpg'), img_gens2_sample)
     #plt.imsave(os.path.join(exp_folder, 'recon_sample.jpg'), img_recons_sample)
     
-    print("MSE: ", np.mean(np.square(x[:10000] - img_recons.copy()), axis = (0,1,2,3)))
-    
-    zmeanvar = np.var(zmean, axis = 0)
-    zlogvarmean = np.mean(np.exp(zlogvar), axis = 0)
-    zsum = zmeanvar + zlogvarmean
-
+    print("MSE: ", np.mean(np.square(x - img_recons)))
     print("variance law = ", np.mean(zsum))
 
     count = 0
@@ -702,11 +733,11 @@ def main():
 #    num_scale    3        4
 #    epochs       700      70
 #    lr           .0001    .00005
-#    lr_epochs    200      60
+#    lr_epochs    250      60
 #    epochs2      1400     140
 #    lr2          .0001    .00005
 #    lr_epochs2   400      120
-#    l2_reg       .0005    .001
+#    l2_reg       None    .001
 
 
 class Struct:
@@ -731,17 +762,19 @@ args = {
     "kernel_size"       : 3,
     "base_dim"          : 32, 
     "fc_dim"            : 512,
-    "epochs"            : 0, #use 700 for cifar
+    "epochs"            : 70, #use 700 for cifar
     "lr"                : 0.00005, #use .0001 for cifar
-    "lr_epochs"         : 60, #use 200 for cifar
+    "lr_epochs"         : 60, #use 250 for cifar
     "lr_fac"            : 0.5, 
     "epochs2"           : 0, #use 1400 for cifar
     "lr2"               : 0.00005, #use .0001 for cifar
     "lr_epochs2"        : 120, #use 1200 for cifar
     "lr_fac2"           : 0.5,
-    "l2_reg"            : 0.001, #use 0.0005 for cifar
-    "val"               : True
+    "l2_reg"            : 0.001, #use None for cifar
+    "val"               : True,
+    "adjust"            : True
 }
 args = Struct(**args)
 
 main()
+
