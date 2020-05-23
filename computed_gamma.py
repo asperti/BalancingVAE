@@ -614,6 +614,10 @@ def main():
         saver.restore(sess, os.path.join(model_path, 'stage2'))
         #saver.restore(sess, '../Tensor/experiments/cifar10/Exp_1/model_best_from1_rate05_every250/stage2')
         #saver.save(sess, os.path.join(model_path, 'stage2'))
+
+    #test 
+    x, _, _ = load_test_dataset(args.dataset, args.root_folder)
+    np.random.shuffle(x)
     x = x[0:10000]
     
     tf.reset_default_graph()
