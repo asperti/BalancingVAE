@@ -1,3 +1,8 @@
+---
+paper: https://arxiv.org/abs/2002.07514
+repository: https://github.com/asperti/BalancingVAE
+---
+
 This repository contains an implementation of Variational Autoencoders with a new balancing strategy between reconstrution error and KL-divergence in the loss function.
 
 Specifically, we enforce a constant balance between these two components via normalization of the reconstruction error by an estimation of its current value, derived from minibatches.
